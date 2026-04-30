@@ -153,6 +153,37 @@ MCP_TOOLS = [
         },
     },
     {
+        "name": "get_macro_definition",
+        "description": "Return the definition/value of a C/C++ preprocessor macro (#define).",
+        "inputSchema": {
+            "type": "object",
+            "required": ["macro_name"],
+            "properties": {
+                "macro_name": {
+                    "type": "string",
+                    "description": "Macro name, e.g. 'MAX_SIZE' or 'ASSERT'",
+                }
+            },
+        },
+    },
+    {
+        "name": "get_enum_definition",
+        "description": (
+            "Return the full definition of a C/C++ enum, including all enumerator values. "
+            "Accepts both the enum tag name and any typedef alias."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": ["enum_name"],
+            "properties": {
+                "enum_name": {
+                    "type": "string",
+                    "description": "Enum tag name or typedef alias, e.g. 'Color' or 'EDirection'",
+                }
+            },
+        },
+    },
+    {
         "name": "get_database_stats",
         "description": "Return the number of entries stored in each table of the database.",
         "inputSchema": {
@@ -239,6 +270,39 @@ def _impl_search_function(args: dict) -> str:
     return "\n".join(lines)
 
 
+def _impl_get_macro_definition(args: dict) -> str:
+    name = args.get("macro_name", "").strip()
+    if not name:
+        return "Error: macro_name is required"
+    row = _db.get_macro(name)
+    if row is None:
+        return f"Macro '{name}' not found."
+    parts = [
+        f"Macro    : {row['name']}",
+        f"File     : {row['file_path']}:{row['line_number']}",
+        f"Value    : {row['value'] or '(empty)'}",
+        "",
+        row["source_code"] or "",
+    ]
+    return "\n".join(parts)
+
+
+def _impl_get_enum_definition(args: dict) -> str:
+    name = args.get("enum_name", "").strip()
+    if not name:
+        return "Error: enum_name is required"
+    row = _db.get_enum(name)
+    if row is None:
+        return f"Enum '{name}' not found."
+    typedef_info = f" (typedef: {row['typedef_name']})" if row.get("typedef_name") else ""
+    return "\n".join([
+        f"Enum     : {row['name']}{typedef_info}",
+        f"File     : {row['file_path']}:{row['line_number']}",
+        "",
+        row["source_code"] or "(source not extracted)",
+    ])
+
+
 def _impl_get_database_stats(args: dict) -> str:
     stats = _db.stats()
     lines = ["Database statistics:"]
@@ -262,6 +326,7 @@ def _impl_analyze_repository(args: dict) -> str:
             f"  functions        : {stats['functions']}\n"
             f"  global_variables : {stats['global_variables']}\n"
             f"  structs          : {stats['structs']}\n"
+            f"  enums            : {stats['enums']}\n"
             f"  macros           : {stats['macros']}\n"
             f"  caller relations : {stats['callers']}\n"
             f"  database         : {_db.db_path}\n"
@@ -276,6 +341,8 @@ _TOOL_DISPATCH = {
     "get_global_variable":   _impl_get_global_variable,
     "get_struct_definition": _impl_get_struct_definition,
     "get_function_callers":  _impl_get_function_callers,
+    "get_macro_definition":  _impl_get_macro_definition,
+    "get_enum_definition":   _impl_get_enum_definition,
     "search_function":       _impl_search_function,
     "get_database_stats":    _impl_get_database_stats,
     "analyze_repository":    _impl_analyze_repository,

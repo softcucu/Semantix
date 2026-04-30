@@ -52,10 +52,24 @@ CREATE INDEX IF NOT EXISTS idx_structs_name
 CREATE INDEX IF NOT EXISTS idx_structs_typedef
     ON structs(typedef_name);
 
+CREATE TABLE IF NOT EXISTS enums (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    name         TEXT    NOT NULL,
+    typedef_name TEXT,
+    file_path    TEXT    NOT NULL,
+    line_number  INTEGER NOT NULL,
+    source_code  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_enums_name
+    ON enums(name);
+CREATE INDEX IF NOT EXISTS idx_enums_typedef
+    ON enums(typedef_name);
+
 CREATE TABLE IF NOT EXISTS macros (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     name        TEXT    NOT NULL,
     value       TEXT,
+    source_code TEXT,
     file_path   TEXT    NOT NULL,
     line_number INTEGER NOT NULL
 );
@@ -130,7 +144,7 @@ class Database:
     def store_analysis(self, analysis_result: dict) -> None:
         """Clear previous data and store fresh analysis results (idempotent)."""
         with self._conn:
-            for table in ("functions", "global_variables", "structs", "macros", "callers"):
+            for table in ("functions", "global_variables", "structs", "enums", "macros", "callers"):
                 self._conn.execute(f"DELETE FROM {table}")
 
             for f in analysis_result.get("functions", []):
@@ -172,11 +186,26 @@ class Database:
                     ),
                 )
 
+            for e in analysis_result.get("enums", []):
+                self._conn.execute(
+                    "INSERT INTO enums"
+                    " (name, typedef_name, file_path, line_number, source_code)"
+                    " VALUES (?,?,?,?,?)",
+                    (
+                        e["name"],
+                        e.get("typedef_name"),
+                        e["file_path"],
+                        e["line_number"],
+                        e.get("source_code", ""),
+                    ),
+                )
+
             for m in analysis_result.get("macros", []):
                 self._conn.execute(
-                    "INSERT INTO macros (name, value, file_path, line_number)"
-                    " VALUES (?,?,?,?)",
-                    (m["name"], m.get("value", ""), m["file_path"], m["line_number"]),
+                    "INSERT INTO macros (name, value, source_code, file_path, line_number)"
+                    " VALUES (?,?,?,?,?)",
+                    (m["name"], m.get("value", ""), m.get("source_code", ""),
+                     m["file_path"], m["line_number"]),
                 )
 
             for func_key, caller_list in analysis_result.get("callers", {}).items():
@@ -189,10 +218,11 @@ class Database:
                     )
 
         logger.info(
-            "Stored: %d functions, %d variables, %d structs, %d macros",
+            "Stored: %d functions, %d variables, %d structs, %d enums, %d macros",
             len(analysis_result.get("functions", [])),
             len(analysis_result.get("global_variables", [])),
             len(analysis_result.get("structs", [])),
+            len(analysis_result.get("enums", [])),
             len(analysis_result.get("macros", [])),
         )
 
@@ -248,6 +278,22 @@ class Database:
         row = cur.fetchone()
         return dict(row) if row else None
 
+    def get_enum(self, name: str) -> Optional[dict]:
+        """Accepts both the enum tag name and the typedef alias."""
+        cur = self._conn.execute(
+            """
+            SELECT * FROM enums
+            WHERE name = ?
+               OR typedef_name = ?
+               OR name LIKE ?
+               OR typedef_name LIKE ?
+            LIMIT 1
+            """,
+            (name, name, f"%::{name}", f"%{name}%"),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
     def get_callers(self, func_name: str) -> list:
         """Return all callers of func_name (matched by qualified or suffix)."""
         cur = self._conn.execute(
@@ -288,7 +334,7 @@ class Database:
     def stats(self) -> dict:
         """Return row counts for all tables."""
         result = {}
-        for table in ("functions", "global_variables", "structs", "macros", "callers"):
+        for table in ("functions", "global_variables", "structs", "enums", "macros", "callers"):
             cur = self._conn.execute(f"SELECT COUNT(*) FROM {table}")
             result[table] = cur.fetchone()[0]
         return result

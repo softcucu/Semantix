@@ -173,16 +173,17 @@ def _deduplicate_tags(all_tags: list) -> list:
 _ANON_RE = re.compile(r"^__anon\w+$")
 
 
-def _find_typedef_struct_start(file_path: str, typedef_line: int) -> int:
+def _find_typedef_keyword_start(file_path: str, typedef_line: int, keyword: str) -> int:
     """
-    Scan backwards from typedef_line to find the opening 'typedef struct' keyword.
-    Returns the 1-based line number of that line, or typedef_line if not found.
-    Used for anonymous structs that Exuberant Ctags 5.9 does not emit a separate 's' tag for.
+    Scan backwards from typedef_line to find 'typedef <keyword>' (struct or enum).
+    Returns the 1-based line number, or typedef_line if not found.
+    Used for anonymous types that Exuberant Ctags 5.9 does not emit a separate tag for.
     """
     lines = _read_file_lines(file_path)
     start_idx = min(typedef_line - 1, len(lines) - 1)
+    pattern = re.compile(rf"\btypedef\s+{keyword}\b")
     for i in range(start_idx, max(start_idx - 100, -1), -1):
-        if re.search(r"\btypedef\s+struct\b", lines[i]):
+        if pattern.search(lines[i]):
             return i + 1  # convert to 1-based
     return typedef_line
 
@@ -216,7 +217,7 @@ def _link_typedef_structs(structs_raw: list, typedef_entries: list) -> list:
         if target is None:
             # Anonymous struct: Exuberant Ctags 5.9 emits no 's' tag.
             # Create a synthetic entry; the actual struct name is the anon internal name.
-            start_line = _find_typedef_struct_start(typedef["file_path"], typedef["line_number"])
+            start_line = _find_typedef_keyword_start(typedef["file_path"], typedef["line_number"], "struct")
             synth = {
                 "name": struct_ref,            # e.g. "__anon1"
                 "qualified_name": struct_ref,
@@ -248,6 +249,69 @@ def _link_typedef_structs(structs_raw: list, typedef_entries: list) -> list:
         else:
             result.append(s)
     return result
+
+
+# ---------------------------------------------------------------------------
+# Typedef-enum linking  (mirrors _link_typedef_structs for kind='g')
+# ---------------------------------------------------------------------------
+
+def _link_typedef_enums(enums_raw: list, typedef_entries: list) -> list:
+    """
+    Match typedef entries (kind='t', typeref starts with 'enum:') to their
+    enum targets.  Annotates enum dicts with `typedef_name`.
+
+    Handles anonymous enums (Exuberant Ctags 5.9 emits no 'g' tag for them):
+    creates synthetic enum entries derived from the typedef tag.
+
+    Returns enums, filtering out un-aliased anonymous ones.
+    """
+    enum_lookup: dict = {}
+    for e in enums_raw:
+        enum_lookup[e["name"]] = e
+        if e["qualified_name"] != e["name"]:
+            enum_lookup[e["qualified_name"]] = e
+
+    synthetic: list = []
+
+    for typedef in typedef_entries:
+        typeref = typedef.get("typeref") or ""
+        if not typeref.startswith("enum:"):
+            continue
+        enum_ref = typeref[len("enum:"):]
+        target = enum_lookup.get(enum_ref) or enum_lookup.get(enum_ref.split("::")[-1])
+
+        if target is None:
+            # Anonymous enum — synthesise an entry
+            start_line = _find_typedef_keyword_start(
+                typedef["file_path"], typedef["line_number"], "enum"
+            )
+            synth = {
+                "name": enum_ref,
+                "qualified_name": enum_ref,
+                "file_path": typedef["file_path"],
+                "line_number": start_line,
+                "kind": "g",
+                "signature": "",
+                "is_qualified": False,
+                "typedef_name": typedef["name"],
+            }
+            synthetic.append(synth)
+            enum_lookup[enum_ref] = synth
+            continue
+
+        existing = target.get("typedef_name")
+        if existing:
+            target["typedef_name"] = f"{existing}, {typedef['name']}"
+        else:
+            target["typedef_name"] = typedef["name"]
+
+    all_enums = enums_raw + synthetic
+
+    # Filter out un-aliased anonymous enums
+    return [
+        e for e in all_enums
+        if not _ANON_RE.match(e["name"]) or e.get("typedef_name")
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -295,17 +359,43 @@ def _find_open_brace(lines: list, start_idx: int, max_scan: int = 50) -> int:
     return -1
 
 
-def _extract_macro_lines(lines: list, idx: int) -> str:
-    """Collect a (possibly multi-line) macro definition."""
-    collected = []
-    i = idx
+def _extract_macro_info(lines: list, ln: int) -> tuple:
+    """
+    Returns (source_code, value) for the macro at line ln (0-based).
+
+    source_code : complete #define text as written, single or multi-line.
+    value       : pure expansion — no '#define NAME(params)' prefix.
+                  For multi-line macros the continuation backslashes are
+                  stripped and lines are joined with newline.
+    """
+    # Collect all continuation lines
+    raw_lines: list = []
+    i = ln
     while i < len(lines):
         raw = lines[i].rstrip("\n")
-        collected.append(raw)
+        raw_lines.append(raw)
         if not raw.rstrip().endswith("\\"):
             break
         i += 1
-    return "\n".join(collected)
+
+    source_code = "\n".join(raw_lines)
+
+    # Strip '#define name(params)' prefix from the first line
+    # Handles: object macros, function-like (incl. variadic '...'), empty macros
+    first = raw_lines[0] if raw_lines else ""
+    m = re.match(r"#\s*define\s+\w+(?:\([^)]*\))?\s*(.*)", first)
+    if m:
+        first_val = m.group(1).rstrip("\\").strip()
+        if len(raw_lines) == 1:
+            value = first_val
+        else:
+            # Multi-line: join continuation lines, strip trailing backslashes
+            parts = [first_val] + [l.rstrip("\\").strip() for l in raw_lines[1:]]
+            value = "\n".join(parts)
+    else:
+        value = source_code  # fallback for unusual macro forms
+
+    return source_code, value
 
 
 def extract_source_block(file_path: str, start_line: int) -> str:
@@ -465,6 +555,7 @@ class CppAnalyzer:
         functions = []
         global_vars = []
         structs_raw = []
+        enums_raw = []
         macros = []
         typedef_entries = []
 
@@ -474,27 +565,31 @@ class CppAnalyzer:
                 tag["is_definition"] = kind == "f"
                 functions.append(tag)
             elif kind == "v":
-                # Only top-level (not class/struct members)
+                # Only top-level (not class/struct/enum members)
                 if not tag.get("class_") and not tag.get("struct_"):
                     global_vars.append(tag)
             elif kind == "s":
                 structs_raw.append(tag)
+            elif kind == "g":
+                enums_raw.append(tag)
             elif kind == "d":
                 macros.append(tag)
             elif kind == "t":
                 typedef_entries.append(tag)
-            # 'c' (class), 'n' (namespace), 'm' (member), 'e' (enum), etc. — ignored
+            # 'c' (class), 'n' (namespace), 'm' (member), 'e' (enumerator value) — ignored
 
         structs = _link_typedef_structs(structs_raw, typedef_entries)
+        enums = _link_typedef_enums(enums_raw, typedef_entries)
 
         logger.info(
-            "Parsed tags: %d functions, %d variables, %d structs, %d macros",
-            len(functions), len(global_vars), len(structs), len(macros),
+            "Parsed tags: %d functions, %d variables, %d structs, %d enums, %d macros",
+            len(functions), len(global_vars), len(structs), len(enums), len(macros),
         )
         return {
             "functions": functions,
             "global_variables": global_vars,
             "structs": structs,
+            "enums": enums,
             "macros": macros,
         }
 
@@ -615,27 +710,26 @@ class CppAnalyzer:
                 struct["file_path"], struct["line_number"]
             )
 
+        # Enrich enums with source code
+        for enum in parsed["enums"]:
+            enum["source_code"] = extract_source_block(
+                enum["file_path"], enum["line_number"]
+            )
+
         # Enrich global variables with source line
         for var in parsed["global_variables"]:
             lines = _read_file_lines(var["file_path"])
             ln = var["line_number"] - 1
             var["source_line"] = lines[ln].rstrip("\n") if 0 <= ln < len(lines) else ""
 
-        # Enrich macros with their expanded value
+        # Enrich macros with source_code (full text) and value (expansion only)
         for macro in parsed["macros"]:
-            lines = _read_file_lines(macro["file_path"])
+            file_lines = _read_file_lines(macro["file_path"])
             ln = macro["line_number"] - 1
-            if 0 <= ln < len(lines):
-                raw = lines[ln].rstrip("\n")
-                m = re.match(
-                    r"#\s*define\s+\w+(?:\([^)]*\))?\s*(.*)", raw, re.DOTALL
-                )
-                value = m.group(1).strip() if m else raw
-                if raw.rstrip().endswith("\\"):
-                    value = _extract_macro_lines(lines, ln)
-                macro["value"] = value
+            if 0 <= ln < len(file_lines):
+                macro["source_code"], macro["value"] = _extract_macro_info(file_lines, ln)
             else:
-                macro["value"] = ""
+                macro["source_code"] = macro["value"] = ""
 
         # Build cscope database and query callers
         self.run_cscope()
@@ -652,6 +746,7 @@ class CppAnalyzer:
             "functions": parsed["functions"],
             "global_variables": parsed["global_variables"],
             "structs": parsed["structs"],
+            "enums": parsed["enums"],
             "macros": parsed["macros"],
             "callers": callers,
         }
