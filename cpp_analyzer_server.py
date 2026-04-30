@@ -2,12 +2,15 @@
 """
 HTTP-based MCP server for C/C++ static analysis.
 
-Implements the MCP protocol (JSON-RPC 2.0) over HTTP/SSE transport
-without requiring the mcp SDK, so it works on Python 3.8+.
+Implements the MCP protocol (JSON-RPC 2.0) over two transports:
 
-Endpoints:
-  GET  /sse                    — SSE event stream (MCP clients connect here)
-  POST /messages?sessionId=X   — JSON-RPC message posting
+  Streamable HTTP transport (MCP spec 2025-03-26) — used by opencode and newer clients:
+    GET  /mcp   — optional SSE stream for server-initiated messages
+    POST /mcp   — send JSON-RPC request, get response in the HTTP body (JSON or SSE)
+
+  Legacy SSE transport (MCP spec 2024-11-05) — used by Claude Code and older clients:
+    GET  /sse                    — long-lived SSE event stream
+    POST /messages?sessionId=X   — JSON-RPC message posting
 
 Usage:
   # Serve an existing database:
@@ -424,12 +427,93 @@ async def handle_message(request: Request) -> Response:
 
 
 # ---------------------------------------------------------------------------
+# Streamable HTTP transport handlers (MCP spec 2025-03-26)
+# Used by opencode and other newer MCP clients.
+# ---------------------------------------------------------------------------
+
+async def handle_mcp_post(request: Request) -> Response:
+    """
+    POST /mcp — receive a JSON-RPC message and return the response directly
+    in the HTTP body.  If the client sends Accept: text/event-stream the
+    response is formatted as an SSE stream; otherwise plain JSON.
+    """
+    try:
+        body = await request.json()
+    except Exception as exc:
+        return JSONResponse(
+            {"jsonrpc": "2.0", "id": None,
+             "error": {"code": -32700, "message": f"Parse error: {exc}"}},
+            status_code=400,
+        )
+
+    logger.debug("POST /mcp ← %s", json.dumps(body)[:200])
+
+    messages = body if isinstance(body, list) else [body]
+    responses = []
+    for msg in messages:
+        resp = await _process_request(msg)
+        if resp is not None:
+            responses.append(resp)
+
+    if not responses:
+        # Notifications only — no response body needed
+        return Response(status_code=202)
+
+    accept = request.headers.get("accept", "")
+
+    if "text/event-stream" in accept:
+        async def event_gen():
+            for resp in responses:
+                data = json.dumps(resp, ensure_ascii=False)
+                yield f"event: message\ndata: {data}\n\n"
+        return StreamingResponse(
+            event_gen(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache"},
+        )
+
+    result = responses[0] if len(responses) == 1 else responses
+    return JSONResponse(result)
+
+
+async def handle_mcp_get(request: Request) -> StreamingResponse:
+    """
+    GET /mcp — optional SSE stream for server-initiated push messages.
+    Most clients use POST /mcp for request/response; this endpoint exists
+    for completeness with the 2025-03-26 spec.
+    """
+    session_id = str(uuid.uuid4())
+    queue: asyncio.Queue = asyncio.Queue()
+    _sessions[session_id] = queue
+
+    return StreamingResponse(
+        _sse_event_generator(session_id, queue),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+async def handle_mcp(request: Request) -> Response:
+    """Dispatch GET/POST /mcp to the correct handler."""
+    if request.method == "GET":
+        return await handle_mcp_get(request)
+    return await handle_mcp_post(request)
+
+
+# ---------------------------------------------------------------------------
 # Starlette app
 # ---------------------------------------------------------------------------
 
 def build_app() -> Starlette:
     return Starlette(
         routes=[
+            # Streamable HTTP transport (opencode, newer clients — MCP 2025-03-26)
+            Route("/mcp", endpoint=handle_mcp, methods=["GET", "POST"]),
+            # Legacy SSE transport (Claude Code, older clients — MCP 2024-11-05)
             Route("/sse", endpoint=handle_sse, methods=["GET"]),
             Route("/messages", endpoint=handle_message, methods=["POST"]),
         ]
@@ -476,8 +560,8 @@ def main() -> None:
     app = build_app()
 
     logger.info("Starting cpp-analyzer MCP server on %s:%d", args.host, args.port)
-    logger.info("  SSE endpoint     : http://%s:%d/sse", args.host, args.port)
-    logger.info("  Messages endpoint: http://%s:%d/messages?sessionId=<id>", args.host, args.port)
+    logger.info("  Streamable HTTP (opencode)  : http://%s:%d/mcp", args.host, args.port)
+    logger.info("  Legacy SSE (Claude Code)    : http://%s:%d/sse", args.host, args.port)
 
     uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level.lower())
 

@@ -97,7 +97,9 @@ class Database:
         repo_name = Path(repo_path).name
         self.db_path = Path.cwd() / f"{repo_name}_analysis.db"
         logger.info("Opening database: %s", self.db_path)
-        self._conn = sqlite3.connect(str(self.db_path))
+        # check_same_thread=False: safe because writes use transactions and
+        # WAL mode allows concurrent reads from multiple threads.
+        self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._create_schema()
@@ -108,7 +110,7 @@ class Database:
         obj = object.__new__(cls)
         obj.db_path = Path(db_path)
         logger.info("Opening database: %s", obj.db_path)
-        obj._conn = sqlite3.connect(str(obj.db_path))
+        obj._conn = sqlite3.connect(str(obj.db_path), check_same_thread=False)
         obj._conn.row_factory = sqlite3.Row
         obj._conn.execute("PRAGMA journal_mode=WAL")
         obj._create_schema()

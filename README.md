@@ -77,13 +77,32 @@ python3 cpp_analyzer_server.py --db ./myrepo_analysis.db --host 0.0.0.0 --port 9
 Server output:
 ```
 INFO     Starting cpp-analyzer MCP server on 127.0.0.1:8080
-INFO     SSE endpoint     : http://127.0.0.1:8080/sse
-INFO     Messages endpoint: http://127.0.0.1:8080/messages?sessionId=<id>
+INFO     Streamable HTTP (opencode)  : http://127.0.0.1:8080/mcp
+INFO     Legacy SSE (Claude Code)    : http://127.0.0.1:8080/sse
 ```
 
-### 3. Connect Claude Code to the server
+### 3. Connect your MCP client
 
-Add the server to your Claude Code MCP configuration:
+**opencode** (uses Streamable HTTP transport — `POST /mcp`):
+
+Add to `~/.config/opencode/config.json`:
+```json
+{
+  "mcp": {
+    "cpp-analyzer": {
+      "type": "http",
+      "url": "http://127.0.0.1:8080/mcp"
+    }
+  }
+}
+```
+
+> **Note — system proxy:** If you have `http_proxy` set in your environment, your client may
+> route `127.0.0.1` requests through the proxy (resulting in 502/404 errors).
+> Make sure `no_proxy` includes `127.0.0.1` and `localhost`, or configure the client
+> to bypass the proxy for local addresses.
+
+**Claude Code** (uses legacy SSE transport — `GET /sse`):
 
 ```json
 {
@@ -93,12 +112,6 @@ Add the server to your Claude Code MCP configuration:
     }
   }
 }
-```
-
-Or run with the `--mcp-server` flag:
-
-```bash
-claude --mcp-server "cpp-analyzer=http://127.0.0.1:8080/sse"
 ```
 
 ## MCP Tools
@@ -277,10 +290,17 @@ arguments:
   --log-level Logging verbosity (default: INFO)
 ```
 
-**MCP Transport protocol:**
+**MCP Transport protocols:**
 
-The server implements the MCP HTTP/SSE transport specification (JSON-RPC 2.0):
+The server supports two transports simultaneously:
 
+*Streamable HTTP (MCP spec 2025-03-26) — used by opencode:*
+1. Client sends `POST /mcp` with a JSON-RPC body
+2. Server replies with `200 OK` + `Content-Type: application/json` containing the result
+3. If the client sends `Accept: text/event-stream`, the response is an SSE stream instead
+4. `GET /mcp` provides an optional SSE channel for server-initiated push
+
+*Legacy SSE (MCP spec 2024-11-05) — used by Claude Code:*
 1. Client connects to `GET /sse` — receives a `text/event-stream` response
 2. Server sends an `endpoint` event: `data: /messages?sessionId=<uuid>`
 3. Client POSTs JSON-RPC messages to `/messages?sessionId=<uuid>`
